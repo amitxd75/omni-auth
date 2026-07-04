@@ -1,0 +1,104 @@
+name: Continuous Integration
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/omni_auth
+  REDIS_URL: redis://localhost:6379
+
+jobs:
+  test:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: omni_auth
+        ports:
+          - 5432:5432
+        # Set health checks to wait until postgres has started
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Install sqlx-cli
+        run: |
+          cargo install sqlx-cli --no-default-features --features postgres --locked || true
+
+      - name: Run Database Migrations
+        run: |
+          sqlx migrate run --source crates/migrations/migrations
+
+      - name: Lint with Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Backend Cargo Tests
+        run: |
+          cargo test --workspace
+
+  sdk:
+    name: SDK Typecheck & Pack Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: TypeScript Typecheck (Core SDK)
+        run: |
+          cd sdk/core
+          bun install
+          bun run typecheck
+
+      - name: TypeScript Typecheck (React SDK)
+        run: |
+          cd sdk/react
+          bun install
+          bun run typecheck
+
+      - name: Make packing script executable
+        run: chmod +x scripts/pack-sdk.sh
+
+      - name: Test SDK Packaging
+        run: ./scripts/pack-sdk.sh

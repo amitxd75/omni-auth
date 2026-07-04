@@ -1,0 +1,36 @@
+# ── Rust build artifacts ───────────────────────
+target/
+
+# ── Dev environment ────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Node / frontend ────────────────────────────
+node_modules/
+example/my-app/.next/
+example/my-app/node_modules/
+sdk/*/node_modules/
+
+# ── VCS ────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Editors ────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── CI / docs ──────────────────────────────────
+.github/
+docs/
+*.md
+!README.md
+
+# ── Scripts ────────────────────────────────────
+scripts/
+
+# ── Misc ───────────────────────────────────────
+*.log
+*.tmp

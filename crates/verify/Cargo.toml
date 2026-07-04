@@ -1,0 +1,14 @@
+[package]
+name = "omni-auth-verify"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+chrono.workspace = true
+base64.workspace = true

@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────
+# OmniAuth — Full Stack
+# Runs the entire auth platform in one command:
+#   docker compose up -d
+#
+# Includes:
+#   - omni-auth-api  (Rust API server on :8080)
+#   - postgres       (PostgreSQL 18 on :5432)
+#   - redis          (Redis 8 on :6379)
+# ─────────────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────
+  postgres:
+    image: postgres:18-alpine
+    container_name: omni-auth-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: omni_auth
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - oa-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d omni_auth"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ───────────────────────────────────────────────
+  redis:
+    image: redis:8-alpine
+    container_name: omni-auth-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - oa-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── OmniAuth API ────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: omni-auth-api:latest
+    container_name: omni-auth-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/omni_auth
+      REDIS_URL: redis://redis:6379
+      # ── Copy your values here or use an .env file ──────
+      # RESEND_API_KEY: re_your_key_here
+      # RESEND_FROM_EMAIL: auth@yourdomain.com
+    env_file:
+      # Loads .env from the project root (one level up from infra/)
+      - path: ../.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/.well-known/jwks.json || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+volumes:
+  oa-pgdata:
+  oa-redisdata:

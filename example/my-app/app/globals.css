@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #000000;
+  --bg-2: #0a0a0a;
+  --bg-3: #111111;
+  --bg-4: #1a1a1a;
+  --border: #222222;
+  --border-2: #2a2a2a;
+  --text: #ffffff;
+  --text-2: #a0a0a0;
+  --text-3: #606060;
+  --accent: #ffffff;
+  --danger: #ff4444;
+  --danger-bg: #1a0000;
+  --success: #44ff88;
+  --success-bg: #001a0a;
+}
+
+@theme inline {
+  --color-background: var(--bg);
+  --color-foreground: var(--text);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-geist-sans), 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 2px; }
+
+/* Base inputs */
+input, select, textarea {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s;
+}
+input:focus, select:focus, textarea:focus {
+  border-color: var(--text-2);
+}
+input::placeholder {
+  color: var(--text-3);
+}
+
+/* Selection */
+::selection {
+  background: #ffffff22;
+  color: #fff;
+}

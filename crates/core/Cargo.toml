@@ -1,0 +1,20 @@
+[package]
+name = "omni-auth-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sqlx.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+argon2.workspace = true
+jsonwebtoken.workspace = true
+rand.workspace = true
+redis.workspace = true
+ring.workspace = true
+tokio.workspace = true
+tracing.workspace = true
