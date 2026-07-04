@@ -19,12 +19,12 @@ OmniAuth is a production-grade, multi-tenant authentication and authorization pl
 
 ```mermaid
 graph TD
-    Client[Client App / Frontend] -->|1. Authenticate with credentials| AuthServer[OmniAuth Server]
-    AuthServer -->|2. Verify & Sign Token with Private Key| DB[(PostgreSQL)]
-    AuthServer -->|3. Issue Access Token| Client
-    Client -->|4. Request with Bearer Token| ResourceServer[Backend Service]
-    ResourceServer -->|5. Fetch JWKS Public Keys (Cached)| AuthServer
-    ResourceServer -->|6. Cryptographically Verify Signature Offline| ResourceServer
+    Client[Client App / Frontend] -->|"1. Authenticate with credentials"| AuthServer[OmniAuth Server]
+    AuthServer -->|"2. Verify & Sign Token with Private Key"| DB[(PostgreSQL)]
+    AuthServer -->|"3. Issue Access Token"| Client
+    Client -->|"4. Request with Bearer Token"| ResourceServer[Backend Service]
+    ResourceServer -->|"5. Fetch JWKS Public Keys (Cached)"| AuthServer
+    ResourceServer -->|"6. Cryptographically Verify Signature Offline"| ResourceServer
 ```
 
 ---
