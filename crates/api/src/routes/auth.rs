@@ -74,14 +74,14 @@ fn get_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 fn make_cookie(token: &str, max_age_days: i64) -> String {
     let max_age_seconds = max_age_days * 24 * 60 * 60;
     format!(
-        "refresh_token={}; Path=/v1/auth; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+        "refresh_token={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
         token, max_age_seconds
     )
 }
 
 /// Helper to format cookie removal
 fn make_clear_cookie() -> String {
-    "refresh_token=; Path=/v1/auth; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string()
+    "refresh_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string()
 }
 
 pub async fn signup_handler(

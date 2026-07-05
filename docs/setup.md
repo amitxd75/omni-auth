@@ -74,13 +74,25 @@ This sets up the core tables:
 
 ---
 
-## 4. Run the API Server
-Start the Axum API server in development mode:
+## 4. Run the API Server (Standalone or Library)
+
+OmniAuth is structured as a hybrid crate supporting both standalone server execution and nested library imports:
+
+### Option A: Standalone Binary Mode
+Start the standalone Axum API server in development mode:
 ```bash
 # Set environment variables from your shell or let cargo read them from .env
 cargo run --bin omni-auth-api
 ```
 The server will bind to `0.0.0.0:8080`.
+
+### Option B: Library Integration Mode
+You can import `omni-auth-api` into an external Rust project's router by listing it as a dependency and mounting the router:
+```rust
+let state = omni_auth_api::middleware::AppState { ... };
+let auth_router = omni_auth_api::routes::create_router(state);
+let app = axum::Router::new().nest("/api", auth_router);
+```
 
 ---
 
