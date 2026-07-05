@@ -11,7 +11,6 @@ OmniAuth is a production-grade, multi-tenant authentication and authorization pl
 - **Multi-Factor Authentication**: Built-in support for Time-Based One-Time Passwords (TOTP/MFA) with secret generation, enrollment, and verification.
 - **Robust Session Management**: Full tracking of active sessions, device client identification, and single-session/global-session revocation.
 - **SDK & React Integration**: Native support for custom TypeScript client SDKs and lightweight React hooks/context wrappers.
-- **CI/CD Built-in**: Full GitHub Actions validation, formatting checking, Clippy static analysis, and automated SDK packaging.
 
 ---
 
