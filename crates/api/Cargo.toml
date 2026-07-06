@@ -26,3 +26,5 @@ reqwest.workspace = true
 chrono.workspace = true
 rand.workspace = true
 dotenvy.workspace = true
+ring.workspace = true
+hex.workspace = true

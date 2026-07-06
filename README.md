@@ -1,6 +1,6 @@
 # OmniAuth
 
-OmniAuth is a production-grade, multi-tenant authentication and authorization platform built in Rust. It provides secure user management, multi-factor authentication (MFA/TOTP), session handling, and OAuth integration using asymmetric cryptography (Ed25519) to sign tokens. This architecture allows backend microservices to perform fast, offline token validation via JWKS (JSON Web Key Sets) without contacting the main authentication database.
+OmniAuth is a multi-tenant authentication and authorization platform built in Rust. It provides secure user management, multi-factor authentication (MFA/TOTP), session handling, and OAuth integration using asymmetric cryptography (Ed25519) to sign tokens. This architecture allows backend microservices to perform fast, offline token validation via JWKS (JSON Web Key Sets) without contacting the main authentication database.
 
 ---
 

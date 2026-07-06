@@ -56,6 +56,10 @@ REFRESH_TOKEN_TTL_DAYS=7
 ADMIN_API_KEY=super_secret_admin_key_change_me
 ALLOWED_CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ALLOW_DEFAULT_PROJECT_FALLBACK=true
+
+# Server URL & Integrations
+BASE_URL=http://localhost:8080
+RESEND_ENABLED=false
 ```
 
 ---

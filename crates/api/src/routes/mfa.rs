@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::middleware::{AppState, AuthenticatedUser};
+use crate::middleware::{AppState, AuthenticatedUser, make_cookie};
 use crate::routes::auth::AuthResponse;
 use omni_auth_core::{
     mfa::{generate_mfa_secret, verify_totp},
@@ -20,10 +20,10 @@ use omni_auth_core::{
     tokens::{MfaTicketClaims, generate_tokens, verify_mfa_ticket},
     users::{get_user_by_id, update_mfa_settings},
 };
+use ring::hmac;
 
 #[derive(Debug, Deserialize)]
 pub struct EnableMfaRequest {
-    pub secret: String,
     pub code: String,
 }
 
@@ -38,13 +38,43 @@ pub struct VerifyMfaRequest {
     pub code: String,
 }
 
-/// Helper function to format and secure HTTP-Only refresh token cookies.
-fn make_cookie(token: &str, max_age_days: i64) -> String {
-    let max_age_seconds = max_age_days * 24 * 60 * 60;
-    format!(
-        "refresh_token={}; Path=/v1/auth; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
-        token, max_age_seconds
-    )
+/// Helper that verifies a TOTP code and invalidates it using a 90s Redis lockout key to prevent replay attacks (OA-L6).
+async fn verify_and_invalidate_totp(
+    redis_conn: &mut redis::aio::ConnectionManager,
+    user_id: Uuid,
+    secret: &str,
+    code: &str,
+) -> Result<bool, Response> {
+    // verify_totp checks only past and current steps (OA-L5) and returns Option<u64>
+    let step = match verify_totp(secret, code) {
+        Some(s) => s,
+        None => return Ok(false),
+    };
+
+    let key = hmac::Key::new(hmac::HMAC_SHA256, b"totp-used-salt");
+    let message = format!("totp-used:{}:{}", user_id, step);
+    let signature = hmac::sign(&key, message.as_bytes());
+    let signature_hex = hex::encode(signature.as_ref());
+    let redis_key = format!("totp_used:{}", signature_hex);
+
+    let exists: bool = redis::Cmd::exists(&redis_key)
+        .query_async(redis_conn)
+        .await
+        .unwrap_or(false);
+
+    if exists {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "This verification code has already been used. Please wait for a new code." })),
+        ).into_response());
+    }
+
+    let _: () = redis::Cmd::set_ex(&redis_key, "1", 90)
+        .query_async(redis_conn)
+        .await
+        .unwrap_or_default();
+
+    Ok(true)
 }
 
 /// HTTP GET handler to initialize TOTP MFA setup.
@@ -53,7 +83,7 @@ pub async fn enroll_handler(
     State(state): State<AppState>,
     user_ctx: AuthenticatedUser,
 ) -> impl IntoResponse {
-    let user = match get_user_by_id(&state.db, user_ctx.user_id).await {
+    let user = match get_user_by_id(&state.db, user_ctx.project.id, user_ctx.user_id).await {
         Ok(u) => u,
         Err(_) => {
             return (
@@ -69,6 +99,14 @@ pub async fn enroll_handler(
         "otpauth://totp/omni-auth:{}?secret={}&issuer=omni-auth",
         user.email, secret
     );
+
+    // Store provisional secret in Redis (OA-M6)
+    let mut redis_conn = state.redis.clone();
+    let provisional_key = format!("mfa_provisional:{}", user_ctx.user_id);
+    let _: () = redis::Cmd::set_ex(&provisional_key, &secret, 900)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
 
     (
         StatusCode::OK,
@@ -87,15 +125,47 @@ pub async fn enable_handler(
     user_ctx: AuthenticatedUser,
     Json(payload): Json<EnableMfaRequest>,
 ) -> impl IntoResponse {
-    if !verify_totp(&payload.secret, &payload.code) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Invalid verification code" })),
-        )
-            .into_response();
+    let mut redis_conn = state.redis.clone();
+    let provisional_key = format!("mfa_provisional:{}", user_ctx.user_id);
+
+    // Retrieve provisional secret from Redis (OA-M6)
+    let secret_opt: Option<String> = redis::Cmd::get(&provisional_key)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(None);
+
+    let secret = match secret_opt {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "MFA enrollment has expired or was not initiated. Please call enroll first." })),
+            )
+                .into_response();
+        }
+    };
+
+    match verify_and_invalidate_totp(&mut redis_conn, user_ctx.user_id, &secret, &payload.code)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid verification code" })),
+            )
+                .into_response();
+        }
+        Err(err_resp) => return err_resp,
     }
 
-    match update_mfa_settings(&state.db, user_ctx.user_id, Some(payload.secret), true).await {
+    // Delete provisional secret
+    let _: () = redis::Cmd::del(&provisional_key)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
+
+    match update_mfa_settings(&state.db, user_ctx.user_id, Some(secret), true).await {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({ "message": "MFA enabled successfully" })),
@@ -119,7 +189,7 @@ pub async fn disable_handler(
     user_ctx: AuthenticatedUser,
     Json(payload): Json<DisableMfaRequest>,
 ) -> impl IntoResponse {
-    let user = match get_user_by_id(&state.db, user_ctx.user_id).await {
+    let user = match get_user_by_id(&state.db, user_ctx.project.id, user_ctx.user_id).await {
         Ok(u) => u,
         Err(_) => {
             return (
@@ -141,12 +211,19 @@ pub async fn disable_handler(
         }
     };
 
-    if !verify_totp(&secret, &payload.code) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Invalid verification code" })),
-        )
-            .into_response();
+    let mut redis_conn = state.redis.clone();
+    match verify_and_invalidate_totp(&mut redis_conn, user_ctx.user_id, &secret, &payload.code)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid verification code" })),
+            )
+                .into_response();
+        }
+        Err(err_resp) => return err_resp,
     }
 
     match update_mfa_settings(&state.db, user_ctx.user_id, None, false).await {
@@ -224,7 +301,7 @@ pub async fn verify_handler(
     };
 
     // 3. Fetch user
-    let user = match get_user_by_id(&state.db, user_id).await {
+    let user = match get_user_by_id(&state.db, project.id, user_id).await {
         Ok(u) => u,
         Err(_) => {
             return (
@@ -247,12 +324,17 @@ pub async fn verify_handler(
     };
 
     // 4. Verify TOTP code
-    if !verify_totp(&secret, &payload.code) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Invalid verification code" })),
-        )
-            .into_response();
+    let mut redis_conn = state.redis.clone();
+    match verify_and_invalidate_totp(&mut redis_conn, user.id, &secret, &payload.code).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid verification code" })),
+            )
+                .into_response();
+        }
+        Err(err_resp) => return err_resp,
     }
 
     // 5. Create session & tokens

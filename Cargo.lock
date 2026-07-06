@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "omni-auth-api"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -1372,11 +1372,13 @@ dependencies = [
  "chrono",
  "dotenvy",
  "figment",
+ "hex",
  "jsonwebtoken",
  "omni-auth-core",
  "rand 0.10.2",
  "redis",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sqlx",
@@ -1392,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "omni-auth-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "argon2",
  "base64",
@@ -1412,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "omni-auth-verify"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "chrono",

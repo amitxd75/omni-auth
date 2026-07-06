@@ -40,10 +40,12 @@ pub async fn run_standalone() -> anyhow::Result<()> {
     tracing::info!("Default project ensured: ID = {}", default_project.id);
 
     // 6. Build AppState
+    let http_client = reqwest::Client::new();
     let state = middleware::AppState {
         db: db_pool,
         redis: redis_conn,
         config: config.clone(),
+        http_client,
     };
 
     // 7. Initialize router

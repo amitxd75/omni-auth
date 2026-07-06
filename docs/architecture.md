@@ -36,9 +36,10 @@ OmniAuth solves this using **Asymmetric Cryptography**:
 OmniAuth supports multiple isolated tenant environments ("Projects") on a single deployment.
 
 - **Project Keypairs**: Every project is assigned its own unique Ed25519 signing keypair during creation. An Access Token signed for Project A cannot be verified or used on Project B, preventing cross-tenant access.
-- **Tenant Context**: Reaffirming separation, the database structure enforces a `project_id` UUID column on all `users`, `sessions`, and `webhooks` tables.
+- **Tenant Context**: Reaffirming separation, the database structure enforces a `project_id` UUID column on all `users`, `sessions`, `webhooks`, and `project_redirect_uris` tables.
 - **Project Header Validation**: Client apps specify their project identity using the `x-project-id` header. Setting `ALLOW_DEFAULT_PROJECT_FALLBACK=false` ensures that if this header is missing, requests are immediately blocked with `400 Bad Request` before hitting any database query blocks.
 - **Project API Secrets (Private Keys)**: In addition to the public `project_id` header, each project generates a secure private API key (`api_key`) prefixed with `oa_proj_`. This key is used for server-to-server (backend-to-auth) authenticated queries via the `x-project-secret` header, verifying backend caller identities securely.
+- **OAuth Allowed Redirect Whitelist**: Dynamic `redirect_uri` callback parameters are checked against the `project_redirect_uris` table in the database to prevent Open Redirect vulnerabilities.
 
 ---
 
@@ -48,7 +49,7 @@ User sessions are fully managed to balance convenience (long-lived logins) with 
 
 ### Tokens Issued
 1. **Access Token**: Short-lived JWT (default 15 minutes) sent in headers for API authorization. Contains user context, project ID, and session ID.
-2. **Refresh Token**: Long-lived token (default 7 days) stored securely in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie. Used to obtain new Access Tokens.
+2. **Refresh Token**: Long-lived token (default 7 days) stored securely in an `HttpOnly`, `Secure`, `SameSite=Lax` cookie at root `Path=/`. Used to obtain new Access Tokens.
 3. **MFA Ticket**: Single-use token (valid for 5 minutes) issued upon correct password entry if MFA is enabled. Requires second-factor verification to exchange for actual Access/Refresh tokens.
 
 ### Token Rotation (RTR)
@@ -62,6 +63,8 @@ To prevent refresh token theft:
 
 MFA is implemented using Time-Based One-Time Passwords (TOTP) conforming to RFC 6238:
 
-- **Secret Storage**: TOTP secrets are generated using cryptographically secure random bytes, Base32 encoded, and stored in the database.
-- **Verification Loop**: During login, if a user has MFA enabled, the API issues an `mfa_ticket`. The user must submit a valid 6-digit TOTP code matching the secret to complete the sign-in flow.
-- **Drift Tolerance**: The verification check supports a clock drift window of ±1 step (30 seconds) to accommodate slight sync issues on client devices.
+- **Provisional Secret Isolation**: During enrollment, the generated TOTP secret key is temporarily stored in Redis under a 15-minute TTL. The server only updates the user's Postgres record with the secret after verifying the first valid client-submitted code, protecting the database from uncompleted setup configurations.
+- **Drift Tolerance**: The verification check supports a clock drift window checking only current and past steps (-1, 0) to avoid clock-drift attacks on future steps.
+- **Replay Code Protection**: TOTP codes verified successfully are HMAC-fingerprinted and locked in Redis for 90 seconds to prevent code reuse and replay attacks.
+- **Constant-Time Verification**: Admin key matching and other credential validations utilize bitwise XOR constant-time comparisons over SHA-256 hashes to eliminate timing side-channel attacks.
+

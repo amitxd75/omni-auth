@@ -23,10 +23,14 @@ pub struct Config {
 
     pub resend_api_key: Option<String>,
     pub resend_from_email: Option<String>,
+    pub resend_enabled: bool,
 
     /// Base URL of the frontend app — used to build clickable email links.
     /// Set FRONTEND_URL in your .env for production.
     pub frontend_url: String,
+
+    /// Base URL of this API server (e.g. http://localhost:8080)
+    pub base_url: String,
 
     pub admin_api_key: Option<String>,
     pub allowed_cors_origins: String,
@@ -51,10 +55,15 @@ impl Config {
                 "http://localhost:3000".to_string(),
             ))
             .merge(Serialized::default(
+                "base_url",
+                "http://localhost:8080".to_string(),
+            ))
+            .merge(Serialized::default(
                 "allowed_cors_origins",
                 "http://localhost:3000,http://127.0.0.1:3000".to_string(),
             ))
             .merge(Serialized::default("allow_default_project_fallback", true))
+            .merge(Serialized::default("resend_enabled", false))
             .merge(Env::raw().map(|key| key.as_str().to_lowercase().into()))
             .extract()
     }

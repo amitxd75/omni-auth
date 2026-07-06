@@ -19,6 +19,7 @@ axum = "0.8.9"
 base64 = "0.22.1"
 chrono = { version = "0.4", features = ["serde"] }
 figment = { version = "0.10", features = ["env", "toml"] }
+hex = "0.4.3"
 jsonwebtoken = { version = "10.4.0", default-features = false, features = [
     "aws_lc_rs",
 ] }

@@ -127,18 +127,20 @@ pub async fn login(
     }
 }
 
-/// Fetches a user profile from the database by its primary UUID key.
+/// Fetches a user profile from the database by its primary UUID key, scoped to project.
 ///
 /// # Parameters
 /// - `pool`: PostgreSQL database connection pool.
+/// - `project_id`: ID of the tenant project.
 /// - `user_id`: Target user account UUID.
-pub async fn get_user_by_id(pool: &sqlx::PgPool, user_id: Uuid) -> Result<User> {
+pub async fn get_user_by_id(pool: &sqlx::PgPool, project_id: Uuid, user_id: Uuid) -> Result<User> {
     let user = sqlx::query_as::<_, User>(
         "SELECT id, project_id, email, password_hash, email_verified, mfa_enabled, mfa_secret, created_at, updated_at
          FROM users
-         WHERE id = $1"
+         WHERE id = $1 AND project_id = $2"
     )
     .bind(user_id)
+    .bind(project_id)
     .fetch_one(pool)
     .await?;
 

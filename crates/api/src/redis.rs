@@ -72,3 +72,56 @@ pub async fn set_idempotency_completed(
         .await?;
     Ok(())
 }
+
+/// Atomically acquires a token from the Redis token-bucket rate limiter.
+/// Returns Ok(true) if allowed, Ok(false) if rate-limited.
+pub async fn acquire_rate_limit_token(
+    redis_conn: &mut ConnectionManager,
+    key: &str,
+    max_tokens: f64,
+    refill_rate: f64, // tokens per second
+) -> Result<bool> {
+    let redis_key = format!("omni-auth:rate_limit:{}", key);
+    let now = chrono::Utc::now().timestamp() as f64;
+
+    let script = redis::Script::new(
+        r#"
+        local key = KEYS[1]
+        local max_tokens = tonumber(ARGV[1])
+        local refill_rate = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+
+        local data = redis.call('HMGET', key, 'tokens', 'last_updated')
+        local tokens = tonumber(data[1])
+        local last_updated = tonumber(data[2])
+
+        if not tokens then
+            tokens = max_tokens
+            last_updated = now
+        else
+            local elapsed = math.max(0, now - last_updated)
+            tokens = math.min(max_tokens, tokens + elapsed * refill_rate)
+            last_updated = now
+        end
+
+        if tokens >= 1 then
+            tokens = tokens - 1
+            redis.call('HMSET', key, 'tokens', tokens, 'last_updated', last_updated)
+            redis.call('EXPIRE', key, 86400)
+            return 1
+        else
+            return 0
+        end
+    "#,
+    );
+
+    let allowed: i32 = script
+        .key(&redis_key)
+        .arg(max_tokens)
+        .arg(refill_rate)
+        .arg(now)
+        .invoke_async(redis_conn)
+        .await?;
+
+    Ok(allowed == 1)
+}

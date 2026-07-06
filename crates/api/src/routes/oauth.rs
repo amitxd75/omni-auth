@@ -2,7 +2,6 @@
 //! Directs authorization steps and handles code exchange callbacks for Google and GitHub.
 
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Redirect},
@@ -12,13 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::middleware::{AppState, AuthenticatedUser};
+use crate::middleware::{AppState, make_cookie};
 use omni_auth_core::{
-    oauth::{get_or_create_oauth_user, link_oauth_account},
-    projects::get_project,
-    sessions::create_session,
+    oauth::get_or_create_oauth_user, projects::get_project, sessions::create_session,
     tokens::generate_tokens,
 };
+use rand::Rng;
 
 #[derive(Debug, Deserialize)]
 pub struct AuthorizeQuery {
@@ -36,6 +34,7 @@ pub struct CallbackQuery {
 struct OauthState {
     project_id: Uuid,
     redirect_uri: String,
+    nonce: String,
 }
 
 // GitHub API JSON models
@@ -58,31 +57,47 @@ struct GoogleUser {
     email: String,
 }
 
-/// Helper to format refresh token cookie (same as auth.rs)
-fn make_cookie(token: &str, max_age_days: i64) -> String {
-    let max_age_seconds = max_age_days * 24 * 60 * 60;
-    format!(
-        "refresh_token={}; Path=/v1/auth; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
-        token, max_age_seconds
+/// Helper function to check if a redirect_uri is whitelisted for a given project (OA-H4).
+async fn is_redirect_uri_allowed(db: &sqlx::PgPool, project_id: Uuid, redirect_uri: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM project_redirect_uris WHERE project_id = $1 AND redirect_uri = $2)"
     )
+    .bind(project_id)
+    .bind(redirect_uri)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false)
 }
 
 /// HTTP GET handler to redirect the client user to the social provider's consent page (Google or GitHub).
-/// Generates and serializes the state parameter containing the tenant project and callback URI.
+/// Generates and serializes the state parameter containing the tenant project, callback URI, and CSRF nonce.
 pub async fn authorize_handler(
     Path(provider): Path<String>,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<AuthorizeQuery>,
 ) -> impl IntoResponse {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:8080");
+    let project_id = query.project_id;
+
+    // 1. Verify redirect_uri is whitelisted (OA-H4)
+    if !is_redirect_uri_allowed(&state.db, project_id, &query.redirect_uri).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            "The redirect_uri is not whitelisted for this project",
+        )
+            .into_response();
+    }
+
+    // 2. Generate cryptographically secure CSRF nonce (OA-H3)
+    let mut nonce_bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = hex::encode(nonce_bytes);
+
     let state_payload = OauthState {
-        project_id: query.project_id,
-        redirect_uri: query.redirect_uri,
+        project_id,
+        redirect_uri: query.redirect_uri.clone(),
+        nonce: nonce.clone(),
     };
+
     let state_bytes = match serde_json::to_vec(&state_payload) {
         Ok(b) => b,
         Err(_) => {
@@ -95,6 +110,15 @@ pub async fn authorize_handler(
     };
     let state_str = BASE64_URL_SAFE_NO_PAD.encode(&state_bytes);
 
+    // Store the CSRF nonce in Redis with 15 min TTL (OA-H3)
+    let mut redis_conn = state.redis.clone();
+    let nonce_redis_key = format!("oauth_nonce:{}", nonce);
+    let _: () = redis::Cmd::set_ex(&nonce_redis_key, "1", 900)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
+
+    // Use configured base_url instead of Host header (OA-M4)
     let redirect_url = match provider.as_str() {
         "github" => {
             let client_id = match &state.config.github_client_id {
@@ -107,7 +131,7 @@ pub async fn authorize_handler(
                         .into_response();
                 }
             };
-            let callback = format!("http://{}/v1/auth/oauth/github/callback", host);
+            let callback = format!("{}/v1/auth/oauth/github/callback", state.config.base_url);
             format!(
                 "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&scope=user:email&state={}",
                 client_id, callback, state_str
@@ -124,7 +148,7 @@ pub async fn authorize_handler(
                         .into_response();
                 }
             };
-            let callback = format!("http://{}/v1/auth/oauth/google/callback", host);
+            let callback = format!("{}/v1/auth/oauth/google/callback", state.config.base_url);
             format!(
                 "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope=openid%20profile%20email&state={}",
                 client_id, callback, state_str
@@ -147,11 +171,7 @@ pub async fn callback_handler(
     headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> impl IntoResponse {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("localhost:8080");
-    // 1. Decode state to retrieve project_id and original redirect_uri
+    // 1. Decode state to retrieve project_id, redirect_uri and CSRF nonce
     let state_bytes = match BASE64_URL_SAFE_NO_PAD.decode(&query.state) {
         Ok(b) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid state format").into_response(),
@@ -160,6 +180,38 @@ pub async fn callback_handler(
         Ok(s) => s,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid state payload").into_response(),
     };
+
+    // 2. Verify CSRF nonce (OA-H3)
+    let mut redis_conn = state.redis.clone();
+    let nonce_redis_key = format!("oauth_nonce:{}", oauth_state.nonce);
+    let nonce_exists: Option<String> = redis::Cmd::get(&nonce_redis_key)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(None);
+
+    if nonce_exists.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "OAuth state is invalid or has expired",
+        )
+            .into_response();
+    }
+
+    // Invalidate CSRF nonce immediately
+    let _: () = redis::Cmd::del(&nonce_redis_key)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
+
+    // 3. Verify redirect_uri is whitelisted (OA-H4)
+    if !is_redirect_uri_allowed(&state.db, oauth_state.project_id, &oauth_state.redirect_uri).await
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "The redirect_uri is not whitelisted for this project",
+        )
+            .into_response();
+    }
 
     let project = match get_project(&state.db, oauth_state.project_id).await {
         Ok(p) => p,
@@ -222,14 +274,14 @@ pub async fn callback_handler(
                 }
             };
 
-            // Fetch GitHub profile
+            // Fetch GitHub profile info
             let profile_res = match client
                 .get("https://api.github.com/user")
+                .header(header::USER_AGENT, "omni-auth")
                 .header(
                     header::AUTHORIZATION,
-                    format!("Bearer {}", token_data.access_token),
+                    format!("token {}", token_data.access_token),
                 )
-                .header(header::USER_AGENT, "omni-auth")
                 .send()
                 .await
             {
@@ -239,6 +291,7 @@ pub async fn callback_handler(
                         .into_response();
                 }
             };
+
             let github_user: GithubUser = match profile_res.json().await {
                 Ok(u) => u,
                 Err(_) => {
@@ -246,16 +299,15 @@ pub async fn callback_handler(
                         .into_response();
                 }
             };
-            let p_id = github_user.id.to_string();
 
-            // Fetch GitHub emails
+            // Fetch GitHub user emails
             let emails_res = match client
                 .get("https://api.github.com/user/emails")
+                .header(header::USER_AGENT, "omni-auth")
                 .header(
                     header::AUTHORIZATION,
-                    format!("Bearer {}", token_data.access_token),
+                    format!("token {}", token_data.access_token),
                 )
-                .header(header::USER_AGENT, "omni-auth")
                 .send()
                 .await
             {
@@ -265,29 +317,33 @@ pub async fn callback_handler(
                         .into_response();
                 }
             };
+
             let emails: Vec<GithubEmail> = match emails_res.json().await {
-                Ok(e) => e,
+                Ok(v) => v,
                 Err(_) => {
                     return (StatusCode::BAD_GATEWAY, "Failed to parse GitHub emails")
                         .into_response();
                 }
             };
 
-            // Find primary and verified email
             let primary_email = emails
-                .iter()
+                .into_iter()
                 .find(|e| e.primary && e.verified)
-                .or_else(|| emails.iter().find(|e| e.verified))
-                .or_else(|| emails.first());
+                .map(|e| e.email)
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "No verified primary email found on GitHub account",
+                    )
+                        .into_response()
+                });
 
-            let u_email = match primary_email {
-                Some(e) => e.email.clone(),
-                None => {
-                    return (StatusCode::BAD_REQUEST, "No email found in GitHub profile")
-                        .into_response();
-                }
+            let email = match primary_email {
+                Ok(e) => e,
+                Err(r) => return r,
             };
-            (p_id, u_email)
+
+            (github_user.id.to_string(), email)
         }
         "google" => {
             let client_id = match &state.config.google_client_id {
@@ -304,7 +360,8 @@ pub async fn callback_handler(
                         .into_response();
                 }
             };
-            let callback = format!("http://{}/v1/auth/oauth/google/callback", host);
+            // Use base_url instead of Host header (OA-M4)
+            let callback = format!("{}/v1/auth/oauth/google/callback", state.config.base_url);
 
             // Exchange code for token
             let token_res = match client
@@ -372,7 +429,7 @@ pub async fn callback_handler(
         _ => return (StatusCode::BAD_REQUEST, "Unsupported OAuth provider").into_response(),
     };
 
-    // 2. Fetch or create mapped local user
+    // 4. Fetch or create mapped local user
     let user = match get_or_create_oauth_user(
         &state.db,
         project.id,
@@ -408,7 +465,7 @@ pub async fn callback_handler(
         return Redirect::to(&target).into_response();
     }
 
-    // 3. Create Session & Tokens
+    // 5. Create Session & Tokens
     let user_agent = headers
         .get(header::USER_AGENT)
         .and_then(|h| h.to_str().ok().map(String::from));
@@ -449,7 +506,7 @@ pub async fn callback_handler(
         }
     };
 
-    // 4. Return tokens
+    // 6. Return tokens
     let target = format!("{}?access_token={}", oauth_state.redirect_uri, access_token);
     (
         StatusCode::FOUND,
@@ -462,46 +519,4 @@ pub async fn callback_handler(
         ],
     )
         .into_response()
-}
-
-#[derive(Debug, Deserialize)]
-pub struct LinkOauthRequest {
-    pub provider: String,
-    pub provider_user_id: String,
-}
-
-/// HTTP POST handler to explicitly link a social OAuth account identity to an existing authenticated user.
-pub async fn link_handler(
-    State(state): State<AppState>,
-    user_ctx: AuthenticatedUser,
-    Json(payload): Json<LinkOauthRequest>,
-) -> impl IntoResponse {
-    match link_oauth_account(
-        &state.db,
-        user_ctx.user_id,
-        user_ctx.project.id,
-        &payload.provider,
-        &payload.provider_user_id,
-    )
-    .await
-    {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(json!({ "message": "OAuth provider linked successfully" })),
-        )
-            .into_response(),
-        Err(omni_auth_core::error::AuthError::UserAlreadyExists) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "This provider account is already linked" })),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!("OAuth link failed: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "Internal server error" })),
-            )
-                .into_response()
-        }
-    }
 }

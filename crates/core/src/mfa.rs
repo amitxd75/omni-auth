@@ -92,34 +92,26 @@ pub fn generate_totp_code(secret_bytes: &[u8], time_step: u64) -> String {
 }
 
 /// Verifies a user-supplied TOTP code against a Base32 secret.
-/// Accommodates a clock drift window of ±1 step (30 seconds) on client devices.
+/// Accommodates a clock drift window of -1 step (30 seconds) on client devices.
 ///
 /// # Parameters
 /// - `secret`: Base32 encoded shared secret.
 /// - `code`: The 6-digit TOTP code to check.
 ///
 /// # Returns
-/// `true` if the code matches any of the steps in the allowed window, `false` otherwise.
-pub fn verify_totp(secret: &str, code: &str) -> bool {
-    let secret_bytes = match decode_base32(secret) {
-        Some(b) => b,
-        None => return false,
-    };
+/// `Some(step)` if the code matches any of the steps in the allowed window, `None` otherwise.
+pub fn verify_totp(secret: &str, code: &str) -> Option<u64> {
+    let secret_bytes = decode_base32(secret)?;
 
-    let current_time = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_secs(),
-        Err(_) => return false,
-    };
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
 
     let step = current_time / 30;
 
-    // Check drift of -1, 0, and +1 steps (30 second intervals)
-    for s in (step.saturating_sub(1))..=(step + 1) {
-        if generate_totp_code(&secret_bytes, s) == code {
-            return true;
-        }
-    }
-    false
+    // Check drift of -1 and 0 steps (30 second intervals) (OA-L5)
+    ((step.saturating_sub(1))..=step).find(|&s| generate_totp_code(&secret_bytes, s) == code)
 }
 
 #[cfg(test)]
@@ -146,7 +138,7 @@ mod tests {
         let step = current_time / 30;
 
         let code = generate_totp_code(&secret_bytes, step);
-        assert!(verify_totp(&secret, &code));
-        assert!(!verify_totp(&secret, "000000"));
+        assert!(verify_totp(&secret, &code).is_some());
+        assert!(verify_totp(&secret, "000000").is_none());
     }
 }

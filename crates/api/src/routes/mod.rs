@@ -55,7 +55,6 @@ pub fn create_router(state: AppState) -> Router {
             "/oauth/{provider}/callback",
             axum::routing::get(oauth::callback_handler),
         )
-        .route("/oauth/link", post(oauth::link_handler))
         .route("/forgot-password", post(auth::forgot_password_handler))
         .route("/reset-password", post(auth::reset_password_handler))
         .route("/change-password", post(auth::change_password_handler))

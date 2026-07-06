@@ -8,9 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::middleware::{AppState, AuthenticatedUser, get_project_id_from_headers};
+use crate::middleware::{
+    AppState, AuthenticatedUser, get_project_id_from_headers, make_clear_cookie, make_cookie,
+};
 use crate::redis::{
-    IdempotencyStatus, check_idempotency, set_idempotency_completed, set_idempotency_in_progress,
+    IdempotencyStatus, acquire_rate_limit_token, check_idempotency, set_idempotency_completed,
+    set_idempotency_in_progress,
 };
 use omni_auth_core::{
     error::AuthError,
@@ -19,6 +22,7 @@ use omni_auth_core::{
     tokens::{RefreshTokenClaims, generate_tokens, rotate_refresh_token, verify_refresh_token},
     users::{User, hash_password, login, signup, verify_password},
 };
+use rand::Rng;
 
 #[derive(Debug, Deserialize)]
 pub struct SignupRequest {
@@ -70,26 +74,23 @@ fn get_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         })
 }
 
-/// Helper to format refresh token cookie
-fn make_cookie(token: &str, max_age_days: i64) -> String {
-    let max_age_seconds = max_age_days * 24 * 60 * 60;
-    format!(
-        "refresh_token={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
-        token, max_age_seconds
-    )
-}
-
-/// Helper to format cookie removal
-fn make_clear_cookie() -> String {
-    "refresh_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string()
-}
-
 pub async fn signup_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<SignupRequest>,
 ) -> Response {
-    let idempotency_key = headers.get("Idempotency-Key").and_then(|h| h.to_str().ok());
+    let idempotency_key = match headers.get("Idempotency-Key").and_then(|h| h.to_str().ok()) {
+        Some(k) => {
+            if k.len() > 128 || !k.chars().all(|c| c.is_alphanumeric() || c == '-') {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Invalid Idempotency-Key format. Must be max 128 characters, alphanumeric + hyphens only." })),
+                ).into_response();
+            }
+            Some(k)
+        }
+        None => None,
+    };
 
     let mut redis_conn = state.redis.clone();
 
@@ -192,7 +193,11 @@ pub async fn signup_handler(
     // Generate and send email verification OTP
     use rand::RngExt;
     let otp_code = format!("{:06}", rand::rng().random_range(100000..1000000));
-    let redis_key = format!("email_verify:{}", user.email);
+    let redis_key = format!(
+        "email_verify:{}:{}",
+        project.id,
+        user.email.trim().to_lowercase()
+    );
     let _: () = redis::Cmd::set_ex(&redis_key, &otp_code, 900)
         .query_async(&mut redis_conn)
         .await
@@ -226,6 +231,15 @@ pub async fn signup_handler(
     (StatusCode::CREATED, Json(response_data)).into_response()
 }
 
+fn get_client_ip(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "unknown_ip".to_string())
+}
+
 pub async fn login_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -246,7 +260,30 @@ pub async fn login_handler(
         }
     };
 
-    let user_res = login(&state.db, project.id, &payload.email, &payload.password).await;
+    let mut redis_conn = state.redis.clone();
+    let email_normalized = payload.email.trim().to_lowercase();
+    let client_ip = get_client_ip(&headers);
+
+    // Rate Limit: 5 requests max, refill 0.5 tokens/sec (1 token/2s)
+    let ip_limit_key = format!("login:ip:{}", client_ip);
+    let email_limit_key = format!("login:email:{}:{}", project.id, email_normalized);
+
+    let allowed_ip = acquire_rate_limit_token(&mut redis_conn, &ip_limit_key, 5.0, 0.5)
+        .await
+        .unwrap_or(true);
+    let allowed_email = acquire_rate_limit_token(&mut redis_conn, &email_limit_key, 5.0, 0.5)
+        .await
+        .unwrap_or(true);
+
+    if !allowed_ip || !allowed_email {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many login attempts. Please try again later." })),
+        )
+            .into_response();
+    }
+
+    let user_res = login(&state.db, project.id, &email_normalized, &payload.password).await;
 
     let user = match user_res {
         Ok(u) => u,
@@ -488,13 +525,18 @@ pub struct VerifyEmailRequest {
 
 pub async fn verify_email_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<VerifyEmailRequest>,
 ) -> impl IntoResponse {
+    let project_id = match get_project_id_from_headers(&headers, &state.config) {
+        Ok(id) => id,
+        Err(err_resp) => return err_resp,
+    };
     let email_normalized = payload.email.trim().to_lowercase();
     let mut redis_conn = state.redis.clone();
 
-    let redis_key = format!("email_verify:{}", email_normalized);
-    let attempts_key = format!("email_verify_attempts:{}", email_normalized);
+    let redis_key = format!("email_verify:{}:{}", project_id, email_normalized);
+    let attempts_key = format!("email_verify_attempts:{}:{}", project_id, email_normalized);
 
     let cached_code: Option<String> = redis::Cmd::get(&redis_key)
         .query_async(&mut redis_conn)
@@ -517,11 +559,14 @@ pub async fn verify_email_handler(
             .await
             .unwrap_or_default();
 
-        // Update user email_verified = true in PG
-        let update_res = sqlx::query("UPDATE users SET email_verified = true WHERE email = $1")
-            .bind(&email_normalized)
-            .execute(&state.db)
-            .await;
+        // Update user email_verified = true in PG (OA-C1, OA-L4)
+        let update_res = sqlx::query(
+            "UPDATE users SET email_verified = true WHERE email = $1 AND project_id = $2",
+        )
+        .bind(&email_normalized)
+        .bind(project_id)
+        .execute(&state.db)
+        .await;
 
         match update_res {
             Ok(_) => (
@@ -585,16 +630,58 @@ pub struct ResendVerificationRequest {
 /// Overwrites any existing verification code and resets the verification attempt limit counter.
 pub async fn resend_verification_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<ResendVerificationRequest>,
 ) -> impl IntoResponse {
+    let project_id = match get_project_id_from_headers(&headers, &state.config) {
+        Ok(id) => id,
+        Err(err_resp) => return err_resp,
+    };
     let email_normalized = payload.email.trim().to_lowercase();
+    let mut redis_conn = state.redis.clone();
+    let client_ip = get_client_ip(&headers);
 
-    // Check if user exists and is not verified
+    // Rate Limit: 5 requests max, refill 0.1 tokens/sec (1 token per 10s)
+    let ip_limit_key = format!("resend:ip:{}", client_ip);
+    let email_limit_key = format!("resend:email:{}:{}", project_id, email_normalized);
+
+    let allowed_ip = acquire_rate_limit_token(&mut redis_conn, &ip_limit_key, 5.0, 0.1)
+        .await
+        .unwrap_or(true);
+    let allowed_email = acquire_rate_limit_token(&mut redis_conn, &email_limit_key, 5.0, 0.1)
+        .await
+        .unwrap_or(true);
+
+    if !allowed_ip || !allowed_email {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many verification resend attempts. Please try again later." })),
+        )
+            .into_response();
+    }
+
+    // Cooldown check (60s) (OA-H1)
+    let cooldown_key = format!("resend_cooldown:{}:{}", project_id, email_normalized);
+    let has_cooldown: Option<String> = redis::Cmd::get(&cooldown_key)
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or(None);
+
+    if has_cooldown.is_some() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Please wait 60 seconds before requesting another verification code." })),
+        )
+            .into_response();
+    }
+
+    // Check if user exists and is not verified (OA-C1, OA-TD4)
     let user_opt = match sqlx::query_as::<_, User>(
-        "SELECT id, email, password_hash, email_verified, mfa_enabled, mfa_secret, created_at, updated_at
-         FROM users WHERE email = $1"
+        "SELECT id, project_id, email, password_hash, email_verified, mfa_enabled, mfa_secret, created_at, updated_at
+         FROM users WHERE email = $1 AND project_id = $2"
     )
     .bind(&email_normalized)
+    .bind(project_id)
     .fetch_optional(&state.db)
     .await {
         Ok(opt) => opt,
@@ -604,41 +691,39 @@ pub async fn resend_verification_handler(
         }
     };
 
-    let user = match user_opt {
-        Some(u) => u,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "User not found" })),
-            )
-                .into_response();
-        }
-    };
+    if let Some(user) = user_opt
+        && !user.email_verified
+    {
+        let redis_key = format!("email_verify:{}:{}", project_id, email_normalized);
+        let attempts_key = format!("email_verify_attempts:{}:{}", project_id, email_normalized);
 
-    if user.email_verified {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Email is already verified" })),
-        )
-            .into_response();
+        // Generate a fresh code
+        use rand::RngExt;
+        let otp_code = format!("{:06}", rand::rng().random_range(100000..1000000));
+        let _: () = redis::Cmd::set_ex(&redis_key, &otp_code, 900)
+            .query_async(&mut redis_conn)
+            .await
+            .unwrap_or_default();
+
+        // Reset attempts key (OA-M3)
+        let _: () = redis::Cmd::del(&attempts_key)
+            .query_async(&mut redis_conn)
+            .await
+            .unwrap_or_default();
+
+        // Set 60s cooldown (OA-H1)
+        let _: () = redis::Cmd::set_ex(&cooldown_key, "1", 60)
+            .query_async(&mut redis_conn)
+            .await
+            .unwrap_or_default();
+
+        crate::email::send_verification_email(&state, email_normalized, otp_code);
     }
 
-    let mut redis_conn = state.redis.clone();
-    let redis_key = format!("email_verify:{}", email_normalized);
-
-    // Generate a fresh code
-    use rand::RngExt;
-    let otp_code = format!("{:06}", rand::rng().random_range(100000..1000000));
-    let _: () = redis::Cmd::set_ex(&redis_key, &otp_code, 900)
-        .query_async(&mut redis_conn)
-        .await
-        .unwrap_or_default();
-
-    crate::email::send_verification_email(&state, email_normalized, otp_code);
-
+    // OA-H2: returns 200 OK always to prevent user enumeration
     (
         StatusCode::OK,
-        Json(json!({ "message": "Verification code resent successfully" })),
+        Json(json!({ "message": "If that email has an unverified account, a verification code has been sent" })),
     )
         .into_response()
 }
@@ -665,6 +750,28 @@ pub async fn forgot_password_handler(
     };
 
     let mut redis_conn = state.redis.clone();
+    let client_ip = get_client_ip(&headers);
+
+    // Rate Limit: 5 requests max, refill 0.1 tokens/sec
+    let ip_limit_key = format!("forgot_pwd:ip:{}", client_ip);
+    let email_limit_key = format!("forgot_pwd:email:{}:{}", project_id, email_normalized);
+
+    let allowed_ip = acquire_rate_limit_token(&mut redis_conn, &ip_limit_key, 5.0, 0.1)
+        .await
+        .unwrap_or(true);
+    let allowed_email = acquire_rate_limit_token(&mut redis_conn, &email_limit_key, 5.0, 0.1)
+        .await
+        .unwrap_or(true);
+
+    if !allowed_ip || !allowed_email {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({ "error": "Too many password recovery requests. Please try again later." }),
+            ),
+        )
+            .into_response();
+    }
 
     // Look up user but don't reveal whether they exist
     let user_exists = sqlx::query_scalar::<_, bool>(
@@ -677,13 +784,13 @@ pub async fn forgot_password_handler(
     .unwrap_or(false);
 
     if user_exists {
-        // Generate a secure 64-char hex token
-        use rand::RngExt;
-        let token: String = (0..64)
-            .map(|_| format!("{:x}", rand::rng().random::<u8>() & 0xf))
-            .collect();
+        // Generate a secure 64-char hex token (32 random bytes) (OA-M2)
+        let mut token_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut token_bytes);
+        let token = hex::encode(token_bytes);
 
-        let redis_key = format!("pwd_reset:{}", email_normalized);
+        // Project-scoped Redis key (OA-C2)
+        let redis_key = format!("pwd_reset:{}:{}", project_id, email_normalized);
         let _: () = redis::Cmd::set_ex(&redis_key, &token, 1800)
             .query_async(&mut redis_conn)
             .await
@@ -731,7 +838,7 @@ pub async fn reset_password_handler(
     }
 
     let mut redis_conn = state.redis.clone();
-    let redis_key = format!("pwd_reset:{}", email_normalized);
+    let redis_key = format!("pwd_reset:{}:{}", project_id, email_normalized);
 
     let stored_token: Option<String> = redis::Cmd::get(&redis_key)
         .query_async(&mut redis_conn)
@@ -941,6 +1048,26 @@ pub async fn request_magic_link_handler(
         Err(err_resp) => return err_resp,
     };
     let mut redis_conn = state.redis.clone();
+    let client_ip = get_client_ip(&headers);
+
+    // Rate Limit: 5 requests max, refill 0.1 tokens/sec
+    let ip_limit_key = format!("magic:ip:{}", client_ip);
+    let email_limit_key = format!("magic:email:{}:{}", project_id, email_normalized);
+
+    let allowed_ip = acquire_rate_limit_token(&mut redis_conn, &ip_limit_key, 5.0, 0.1)
+        .await
+        .unwrap_or(true);
+    let allowed_email = acquire_rate_limit_token(&mut redis_conn, &email_limit_key, 5.0, 0.1)
+        .await
+        .unwrap_or(true);
+
+    if !allowed_ip || !allowed_email {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many magic link requests. Please try again later." })),
+        )
+            .into_response();
+    }
 
     // Only send link if user exists AND is verified (magic link = login, not signup)
     let user_opt = sqlx::query_scalar::<_, bool>(
@@ -953,13 +1080,13 @@ pub async fn request_magic_link_handler(
     .unwrap_or(false);
 
     if user_opt {
-        // Generate a 64-char hex token (32 random bytes)
-        use rand::RngExt;
-        let token: String = (0..64)
-            .map(|_| format!("{:x}", rand::rng().random::<u8>() & 0xf))
-            .collect();
+        // Generate a secure 64-char hex token (32 random bytes) (OA-M2)
+        let mut token_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut token_bytes);
+        let token = hex::encode(token_bytes);
 
-        let redis_key = format!("magic_link:{}", email_normalized);
+        // Project-scoped Redis key (OA-C3)
+        let redis_key = format!("magic_link:{}:{}", project_id, email_normalized);
         // Single-use, 15-minute TTL
         let _: () = redis::Cmd::set_ex(&redis_key, &token, 900)
             .query_async(&mut redis_conn)
@@ -998,8 +1125,8 @@ pub async fn verify_magic_link_handler(
     };
     let mut redis_conn = state.redis.clone();
 
-    // Retrieve and validate stored token
-    let redis_key = format!("magic_link:{}", email_normalized);
+    // Retrieve and validate stored token (OA-C3)
+    let redis_key = format!("magic_link:{}:{}", project_id, email_normalized);
     let stored: Option<String> = redis::Cmd::get(&redis_key)
         .query_async(&mut redis_conn)
         .await

@@ -21,6 +21,7 @@ pub struct AppState {
     pub db: sqlx::PgPool,
     pub redis: redis::aio::ConnectionManager,
     pub config: Config,
+    pub http_client: reqwest::Client,
 }
 
 /// Resolved context of an authenticated API user caller.
@@ -117,7 +118,22 @@ where
             });
 
         match incoming_key {
-            Some(key) if key == expected_key => Ok(AdminAuth),
+            Some(key) => {
+                use ring::digest::{self, SHA256};
+
+                let expected_hash = digest::digest(&SHA256, expected_key.as_bytes());
+                let incoming_hash = digest::digest(&SHA256, key.as_bytes());
+
+                if constant_time_eq(expected_hash.as_ref(), incoming_hash.as_ref()) {
+                    Ok(AdminAuth)
+                } else {
+                    Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": "Invalid or missing Admin API Key" })),
+                    )
+                        .into_response())
+                }
+            }
             _ => Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({ "error": "Invalid or missing Admin API Key" })),
@@ -300,10 +316,47 @@ where
                 .into_response()
         })?;
 
+        // Verify session is active in the database (OA-H5)
+        let _session = omni_auth_core::sessions::get_session(&app_state.db, session_id)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Session is invalid or has been revoked" })),
+                )
+                    .into_response()
+            })?;
+
         Ok(AuthenticatedUser {
             user_id,
             session_id,
             project,
         })
     }
+}
+
+/// Helper to format and secure HTTP-Only refresh token cookies at root Path=/ (OA-L3)
+pub fn make_cookie(token: &str, max_age_days: i64) -> String {
+    let max_age_seconds = max_age_days * 24 * 60 * 60;
+    format!(
+        "refresh_token={}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={}",
+        token, max_age_seconds
+    )
+}
+
+/// Helper to format cookie removal
+pub fn make_clear_cookie() -> String {
+    "refresh_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT".to_string()
+}
+
+/// Constant-time byte slice comparison to mitigate timing attacks (OA-C4)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
+    }
+    result == 0
 }
