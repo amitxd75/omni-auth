@@ -1,5 +1,5 @@
 -- Add api_key column to projects
-ALTER TABLE projects ADD COLUMN api_key VARCHAR(255) NOT NULL DEFAULT '';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS api_key VARCHAR(255) NOT NULL DEFAULT '';
 
 -- Populate a default api_key for the default project if it exists
 UPDATE projects 
