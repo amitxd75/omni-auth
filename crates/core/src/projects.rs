@@ -116,6 +116,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_db_keys() {
+        let _ = dotenvy::dotenv();
         let db_url = std::env::var("DATABASE_URL")
             .unwrap_or("postgres://postgres:postgres@localhost:5432/omni_auth".to_string());
         let pool = PgPool::connect(&db_url).await.unwrap();
@@ -138,6 +139,7 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_project_api_key() {
+        let _ = dotenvy::dotenv();
         let db_url = std::env::var("DATABASE_URL")
             .unwrap_or("postgres://postgres:postgres@localhost:5432/omni_auth".to_string());
         let pool = PgPool::connect(&db_url).await.unwrap();

@@ -18,3 +18,7 @@ redis.workspace = true
 ring.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+dotenvy.workspace = true
+
